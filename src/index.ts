@@ -61,12 +61,22 @@ function formatDuration(millis: number | null): string {
 	return `${hours}h ${minutes}m`;
 }
 
+// Day labels are already local calendar dates (YYYY-MM-DD). Format them in UTC
+// so the server's own time zone cannot shift them by a day.
 function formatDate(isoString: string): string {
 	return new Date(isoString).toLocaleDateString('en-US', {
 		weekday: 'short',
 		month: 'short',
 		day: 'numeric',
+		timeZone: 'UTC',
 	});
+}
+
+function offsetToMs(offset: string | null): number {
+	const m = offset?.match(/^([+-])(\d{2}):(\d{2})$/);
+	if (!m) return 0;
+	const ms = (Number(m[2]) * 60 + Number(m[3])) * 60_000;
+	return m[1] === '-' ? -ms : ms;
 }
 
 function getRecoveryZone(score: number): string {
@@ -408,9 +418,10 @@ function createMcpServer(): Server {
 					if (minStrain !== undefined) response += ` with strain >= ${minStrain}`;
 					response += '.\n\n';
 
-					const fmtIso = (iso: string | null): string => {
+					// Show times in the workout's own UTC offset, not the server's time zone.
+					const fmtIso = (iso: string | null, offset: string | null): string => {
 						if (!iso) return 'N/A';
-						return new Date(iso).toLocaleString('en-US', {
+						return new Date(new Date(iso).getTime() + offsetToMs(offset)).toLocaleString('en-US', {
 							weekday: 'short',
 							year: 'numeric',
 							month: 'short',
@@ -418,6 +429,7 @@ function createMcpServer(): Server {
 							hour: 'numeric',
 							minute: '2-digit',
 							hour12: false,
+							timeZone: 'UTC',
 						});
 					};
 					const fmtMs = (ms: number | null): string => {
@@ -431,11 +443,11 @@ function createMcpServer(): Server {
 						const sport = w.sport_name ?? `Sport #${w.sport_id}`;
 						const durationMs = new Date(w.end_time).getTime() - new Date(w.start_time).getTime();
 
-						response += `## ${sport.charAt(0).toUpperCase() + sport.slice(1)} — ${fmtIso(w.start_time)}\n`;
+						response += `## ${sport.charAt(0).toUpperCase() + sport.slice(1)} — ${fmtIso(w.start_time, w.timezone_offset)}\n`;
 						response += `- **ID**: \`${w.id}\` (sport_id ${w.sport_id}`;
 						if (w.v1_id !== null) response += `, v1_id ${w.v1_id}`;
 						response += `)\n`;
-						response += `- **Start → End**: ${fmtIso(w.start_time)} → ${fmtIso(w.end_time)}`;
+						response += `- **Start → End**: ${fmtIso(w.start_time, w.timezone_offset)} → ${fmtIso(w.end_time, w.timezone_offset)}`;
 						if (w.timezone_offset) response += ` (${w.timezone_offset})`;
 						response += `\n`;
 						response += `- **Duration**: ${formatDuration(durationMs)}\n`;
@@ -485,7 +497,7 @@ function createMcpServer(): Server {
 						}
 
 						if (w.created_at || w.updated_at) {
-							response += `- **Record**: created ${fmtIso(w.created_at)} · updated ${fmtIso(w.updated_at)}\n`;
+							response += `- **Record**: created ${fmtIso(w.created_at, w.timezone_offset)} · updated ${fmtIso(w.updated_at, w.timezone_offset)}\n`;
 						}
 
 						response += '\n';
@@ -536,7 +548,7 @@ function createMcpServer(): Server {
 				case 'get_readiness_brief': {
 					const recovery = db.getLatestRecovery();
 					const sleep = db.getLatestSleep();
-					const cycle = db.getLatestCycle();
+					const yesterday = db.getLatestCompletedCycle();
 					const avgHrv3 = db.getAvgHrv(3);
 					const avgHrv30 = db.getAvgHrv(30);
 					const avgRhr30 = db.getAvgRhr(30);
@@ -616,8 +628,8 @@ function createMcpServer(): Server {
 						response += `- **Last sleep**: ${formatDuration(actualSleep)} actual · need ${formatDuration(totalNeed)}`;
 						response += sleepShortfall > 0 ? ` · ${formatDuration(sleepShortfall)} short\n` : ` · met\n`;
 					}
-					if (cycle?.strain !== null && cycle?.strain !== undefined) {
-						response += `- **Yesterday's strain**: ${cycle.strain.toFixed(1)} ${getStrainZone(cycle.strain)}\n`;
+					if (yesterday?.strain !== null && yesterday?.strain !== undefined) {
+						response += `- **Yesterday's strain**: ${yesterday.strain.toFixed(1)} ${getStrainZone(yesterday.strain)}\n`;
 					}
 
 					return { content: [{ type: 'text', text: response }] };
