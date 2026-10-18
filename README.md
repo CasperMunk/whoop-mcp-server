@@ -39,38 +39,6 @@ Built using the [Whoop Developer API v2](https://developer.whoop.com/docs/introd
 |------|-----------|-------------|
 | `get_workouts` | `days` (1–90, default 14), `min_strain` (number, optional) | Every captured workout field per session: id, sport, start/end + TZ, duration, strain, HR, zones ms + %, distance, elevation, % recorded, score state, record timestamps |
 
-### Nutrition & activity (Apple Health via Health Auto Export)
-| Tool | Arguments | Description |
-|------|-----------|-------------|
-| `get_nutrition_today` | — | Today's macros (kcal/protein/carbs/fat with %-of-kcal, fat subtypes, fiber, sugar) + micros (Na, K, Ca, Fe, cholesterol, vitamin C) and individual energy entries. Auto-converts kJ → kcal |
-| `get_nutrition_trend` | `days` (1–90, default 14) | Daily macro rollup with averages |
-| `get_energy_balance` | `days` (1–90, default 14) | Whoop kcal burned vs Apple Health kcal consumed, joined by cycle time-window. Shows deficit/surplus and protein per kg bodyweight |
-| `get_energy_expenditure` | `days` (1–90, default 14) | Basal (BMR) + active kcal from Apple Health alongside Whoop cycle kcal, with Apple − Whoop delta |
-| `get_daily_activity` | `days` (1–90, default 14) | Steps, walking distance, flights climbed — NEAT signal that complements `get_training_load` |
-| `get_gait_metrics` | `days` (1–90, default 14) | Walking speed, step length, asymmetry %, double-support %. Injury-prevention signal |
-
-### Garmin (via local push script, requires GARMIN_PUSH_TOKEN)
-| Tool | Arguments | Description |
-|------|-----------|-------------|
-| `get_body_composition` | `days` (1–90, default 30) | Body composition trend from the Garmin Index scale: weight, BMI, body fat %, muscle mass, bone mass, body water %. Rolling 7/30-day averages and week-over-week delta. Data is pushed by `scripts/garmin_push.py` run locally — see below |
-
-**Why local push instead of server pull?** Garmin's SSO sits behind Cloudflare which bot-blocks requests from big cloud provider IP ranges (Railway included). Running a small script on your laptop sidesteps that entirely. The server just accepts JSON over HTTPS.
-
-**Setup:**
-
-```bash
-python3 -m venv scripts/.venv
-source scripts/.venv/bin/activate
-pip install garminconnect requests
-
-GARMIN_EMAIL=you@example.com \
-GARMIN_PASSWORD='...' \
-GARMIN_PUSH_TOKEN='matches-server-env-var' \
-python3 scripts/garmin_push.py
-```
-
-Run it whenever you weigh in, or schedule it via cron / launchd / systemd.
-
 ### Account
 | Tool | Arguments | Description |
 |------|-----------|-------------|
@@ -112,7 +80,7 @@ Run it whenever you weigh in, or schedule it via cron / launchd / systemd.
 2. Click "Add custom connector"
 3. Enter:
    - **Name**: Whoop
-   - **Remote MCP server URL**: `https://your-app.railway.app/mcp`
+   - **Remote MCP server URL**: `https://your-app.railway.app/mcp/<MCP_PATH_SECRET>`
 4. Use it in any chat!
 
 ## Local Development
@@ -144,8 +112,7 @@ npm test
 | `WHOOP_CLIENT_SECRET` | Whoop OAuth client secret | Required |
 | `WHOOP_REDIRECT_URI` | OAuth callback URL | `http://localhost:3000/callback` |
 | `ENCRYPTION_SECRET` | Key-derivation secret for token-at-rest encryption | Falls back to `WHOOP_CLIENT_SECRET` |
-| `HEALTHKIT_TOKEN` | Bearer token required on `POST /healthkit` from Health Auto Export | Optional; unset = endpoint returns 503 |
-| `GARMIN_PUSH_TOKEN` | Bearer token required on `POST /garmin/body-composition` from the local `garmin_push.py` script | Optional; unset = endpoint returns 503 |
+| `MCP_PATH_SECRET` | Random secret (32+ characters) that becomes part of the MCP URL: `/mcp/<secret>`. Generate with `openssl rand -hex 32` | Unset = unauthenticated `/mcp` with a startup warning |
 | `DB_PATH` | SQLite database path | `./whoop.db` |
 | `PORT` | HTTP server port | `3000` |
 | `MCP_MODE` | `http` for remote, `stdio` for local | `http` |

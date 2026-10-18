@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import express, { type Request, type Response } from 'express';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
@@ -20,8 +21,7 @@ const config = {
 	dbPath: process.env.DB_PATH ?? './whoop.db',
 	port: Number.parseInt(process.env.PORT ?? '3000', 10),
 	mode: process.env.MCP_MODE ?? 'http',
-	healthkitToken: process.env.HEALTHKIT_TOKEN ?? '',
-	garminPushToken: process.env.GARMIN_PUSH_TOKEN ?? '',
+	mcpPathSecret: process.env.MCP_PATH_SECRET ?? '',
 };
 
 const db = new WhoopDatabase(config.dbPath);
@@ -38,6 +38,32 @@ if (existingTokens) {
 }
 
 const sync = new WhoopSync(client, db);
+
+// OAuth state values issued by get_auth_url. /callback only accepts a code
+// that comes back with one of these, so nobody can push their own Whoop
+// account's tokens into this server by hitting /callback directly.
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const pendingOauthStates = new Map<string, number>();
+
+function issueOauthState(): string {
+	const state = randomUUID();
+	pendingOauthStates.set(state, Date.now() + OAUTH_STATE_TTL_MS);
+	return state;
+}
+
+function consumeOauthState(state: string | undefined): boolean {
+	if (!state) return false;
+	const expiresAt = pendingOauthStates.get(state);
+	pendingOauthStates.delete(state);
+	return expiresAt !== undefined && expiresAt > Date.now();
+}
+
+function secretMatches(candidate: string | undefined, secret: string): boolean {
+	if (!candidate) return false;
+	const a = Buffer.from(candidate);
+	const b = Buffer.from(secret);
+	return a.length === b.length && timingSafeEqual(a, b);
+}
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const transports = new Map<string, { transport: StreamableHTTPServerTransport; lastAccess: number }>();
@@ -199,65 +225,6 @@ function createMcpServer(): Server {
 				description: 'Get the authenticated user profile and body measurements (height, weight, max heart rate) from Whoop.',
 				inputSchema: { type: 'object', properties: {}, required: [] },
 			},
-			{
-				name: 'get_nutrition_today',
-				description: 'Today\'s nutrition from Apple Health (via Health Auto Export): total kcal, protein, carbs, fat, plus the individual entries.',
-				inputSchema: { type: 'object', properties: {}, required: [] },
-			},
-			{
-				name: 'get_nutrition_trend',
-				description: 'Daily nutrition rollup from Apple Health (kcal, protein, carbs, fat) over the requested window.',
-				inputSchema: {
-					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 90)' } },
-					required: [],
-				},
-			},
-			{
-				name: 'get_energy_balance',
-				description: 'Day-by-day energy balance: Whoop kcal burned vs Apple Health kcal consumed, with deficit/surplus and protein per kg of body weight.',
-				inputSchema: {
-					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 90)' } },
-					required: [],
-				},
-			},
-			{
-				name: 'get_daily_activity',
-				description: 'Daily non-workout activity from Apple Health: steps, walking distance, flights climbed. Complements get_training_load by showing NEAT (non-exercise activity thermogenesis) — a day with low Whoop strain and high steps is different from a truly sedentary day.',
-				inputSchema: {
-					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 90)' } },
-					required: [],
-				},
-			},
-			{
-				name: 'get_energy_expenditure',
-				description: 'Daily energy expenditure from Apple Health: basal (BMR) + active kcal, with the Whoop cycle kcal alongside for cross-validation. Auto-converts kJ to kcal. Useful sanity check since Whoop and Apple Watch estimate burn differently.',
-				inputSchema: {
-					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 90)' } },
-					required: [],
-				},
-			},
-			{
-				name: 'get_body_composition',
-				description: 'Body composition trend from the Garmin Index smart scale: weight, BMI, body fat %, body water %, muscle mass, bone mass, physique / visceral / metabolic-age where available. Includes rolling 7/30-day averages and a week-over-week delta so bulk/cut decisions have a real trend.',
-				inputSchema: {
-					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 30, max: 90)' } },
-					required: [],
-				},
-			},
-			{
-				name: 'get_gait_metrics',
-				description: 'Walking gait metrics from Apple Health: walking speed, step length, asymmetry %, and double-support %. Used to spot injury-prevention signals — persistent asymmetry or elongated double-support time can flag developing issues before they become symptomatic.',
-				inputSchema: {
-					type: 'object',
-					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 90)' } },
-					required: [],
-				},
-			},
 		],
 	}));
 
@@ -269,7 +236,6 @@ function createMcpServer(): Server {
 			const dataTools = [
 				'get_today', 'get_recovery_trends', 'get_sleep_analysis', 'get_strain_history',
 				'get_workouts', 'get_readiness_brief', 'get_training_load', 'get_sleep_debt',
-				'get_energy_balance',
 			];
 			if (dataTools.includes(name)) {
 				const tokens = db.getTokens();
@@ -536,7 +502,7 @@ function createMcpServer(): Server {
 
 				case 'get_auth_url': {
 					const scopes = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
-					const url = client.getAuthorizationUrl(scopes);
+					const url = client.getAuthorizationUrl(scopes, issueOauthState());
 					return {
 						content: [{
 							type: 'text',
@@ -792,432 +758,6 @@ function createMcpServer(): Server {
 					return { content: [{ type: 'text', text: response }] };
 				}
 
-				case 'get_nutrition_today': {
-					const metrics = [
-						'dietary_energy', 'protein', 'carbohydrates', 'total_fat',
-						'saturated_fat', 'monounsaturated_fat', 'polyunsaturated_fat',
-						'fiber', 'dietary_sugar', 'cholesterol',
-						'sodium', 'potassium', 'calcium', 'iron', 'vitamin_c',
-					];
-					const totals = db.getHealthkitDailyTotals(1, metrics);
-					const today = new Date().toISOString().slice(0, 10);
-					const todayRows = totals.filter(t => t.date === today);
-
-					if (todayRows.length === 0) {
-						return { content: [{ type: 'text', text: `No nutrition data received for today (${today}) yet.` }] };
-					}
-
-					const toKcal = (qty: number, units: string | null): number => units === 'kJ' ? qty / 4.184 : qty;
-					const byMetric = new Map(todayRows.map(r => [r.metric, r]));
-					const show = (key: string, unit: string, digits = 1): string | null => {
-						const r = byMetric.get(key);
-						if (!r) return null;
-						return `${r.total.toFixed(digits)} ${unit}`;
-					};
-
-					const kcal = byMetric.get('dietary_energy');
-					const protein = byMetric.get('protein');
-					const carbs = byMetric.get('carbohydrates');
-					const fat = byMetric.get('total_fat');
-
-					let response = `# Nutrition Today (${today})\n\n`;
-					response += `## Macros\n`;
-					if (kcal) response += `- **Energy**: ${toKcal(kcal.total, kcal.units).toFixed(0)} kcal (${kcal.count} ${kcal.count === 1 ? 'entry' : 'entries'})\n`;
-					if (protein) {
-						const kcalFromProtein = protein.total * 4;
-						const pct = kcal ? (kcalFromProtein / toKcal(kcal.total, kcal.units)) * 100 : null;
-						response += `- **Protein**: ${protein.total.toFixed(1)} g${pct !== null ? ` (${pct.toFixed(0)}% of kcal)` : ''}\n`;
-					}
-					if (carbs) {
-						const kcalFromCarbs = carbs.total * 4;
-						const pct = kcal ? (kcalFromCarbs / toKcal(kcal.total, kcal.units)) * 100 : null;
-						response += `- **Carbs**: ${carbs.total.toFixed(1)} g${pct !== null ? ` (${pct.toFixed(0)}% of kcal)` : ''}\n`;
-					}
-					if (fat) {
-						const kcalFromFat = fat.total * 9;
-						const pct = kcal ? (kcalFromFat / toKcal(kcal.total, kcal.units)) * 100 : null;
-						response += `- **Fat**: ${fat.total.toFixed(1)} g${pct !== null ? ` (${pct.toFixed(0)}% of kcal)` : ''}\n`;
-					}
-
-					const sat = show('saturated_fat', 'g');
-					const mono = show('monounsaturated_fat', 'g');
-					const poly = show('polyunsaturated_fat', 'g');
-					if (sat || mono || poly) {
-						response += `  - Saturated ${sat ?? 'N/A'} · Monounsaturated ${mono ?? 'N/A'} · Polyunsaturated ${poly ?? 'N/A'}\n`;
-					}
-
-					const fiber = show('fiber', 'g');
-					const sugar = show('dietary_sugar', 'g');
-					if (fiber || sugar) {
-						response += `- **Fiber / Sugar**: ${fiber ?? 'N/A'} / ${sugar ?? 'N/A'}\n`;
-					}
-
-					const sodium = show('sodium', 'mg', 0);
-					const potassium = show('potassium', 'mg', 0);
-					const calcium = show('calcium', 'mg', 0);
-					const iron = show('iron', 'mg');
-					const cholesterol = show('cholesterol', 'mg', 0);
-					const vitC = show('vitamin_c', 'mg', 0);
-					if (sodium || potassium || calcium || iron || cholesterol || vitC) {
-						response += `\n## Micros\n`;
-						if (sodium) response += `- Sodium: ${sodium}\n`;
-						if (potassium) response += `- Potassium: ${potassium}\n`;
-						if (calcium) response += `- Calcium: ${calcium}\n`;
-						if (iron) response += `- Iron: ${iron}\n`;
-						if (cholesterol) response += `- Cholesterol: ${cholesterol}\n`;
-						if (vitC) response += `- Vitamin C: ${vitC}\n`;
-					}
-
-					const kcalEntries = db.getHealthkitSamples('dietary_energy', 1)
-						.filter(e => e.date.startsWith(today));
-					if (kcalEntries.length > 0) {
-						response += `\n## Entries\n`;
-						for (const e of kcalEntries) {
-							const t = new Date(e.date).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
-							response += `- ${t} — ${toKcal(e.qty, e.units).toFixed(0)} kcal\n`;
-						}
-					}
-
-					return { content: [{ type: 'text', text: response }] };
-				}
-
-				case 'get_nutrition_trend': {
-					const days = validateDays(typedArgs.days);
-					const metrics = ['dietary_energy', 'protein', 'carbohydrates', 'total_fat'];
-					const rows = db.getHealthkitDailyTotals(days, metrics);
-
-					if (rows.length === 0) {
-						return { content: [{ type: 'text', text: `No nutrition data in the last ${days} days.` }] };
-					}
-
-					const toKcal = (qty: number, units: string | null): number => units === 'kJ' ? qty / 4.184 : qty;
-					const byDate = new Map<string, { kcal: number | null; protein: number | null; carbs: number | null; fat: number | null }>();
-					for (const r of rows) {
-						if (!byDate.has(r.date)) byDate.set(r.date, { kcal: null, protein: null, carbs: null, fat: null });
-						const d = byDate.get(r.date)!;
-						if (r.metric === 'dietary_energy') d.kcal = toKcal(r.total, r.units);
-						else if (r.metric === 'protein') d.protein = r.total;
-						else if (r.metric === 'carbohydrates') d.carbs = r.total;
-						else if (r.metric === 'total_fat') d.fat = r.total;
-					}
-
-					let response = `# Nutrition (Last ${days} Days)\n\n`;
-					response += '| Date | kcal | Protein | Carbs | Fat |\n|------|------|---------|-------|-----|\n';
-					const fmt = (v: number | null, unit: string): string => v === null ? 'N/A' : `${v.toFixed(unit === 'kcal' ? 0 : 1)} ${unit}`;
-
-					let kSum = 0, pSum = 0, cSum = 0, fSum = 0;
-					let kCount = 0, pCount = 0, cCount = 0, fCount = 0;
-					const sortedDates = Array.from(byDate.keys()).sort().reverse();
-					for (const date of sortedDates) {
-						const d = byDate.get(date)!;
-						response += `| ${formatDate(date)} | ${fmt(d.kcal, 'kcal')} | ${fmt(d.protein, 'g')} | ${fmt(d.carbs, 'g')} | ${fmt(d.fat, 'g')} |\n`;
-						if (d.kcal !== null) { kSum += d.kcal; kCount++; }
-						if (d.protein !== null) { pSum += d.protein; pCount++; }
-						if (d.carbs !== null) { cSum += d.carbs; cCount++; }
-						if (d.fat !== null) { fSum += d.fat; fCount++; }
-					}
-
-					response += `\n### Averages\n`;
-					if (kCount > 0) response += `- **kcal**: ${(kSum / kCount).toFixed(0)} / day (n=${kCount})\n`;
-					if (pCount > 0) response += `- **Protein**: ${(pSum / pCount).toFixed(1)} g / day\n`;
-					if (cCount > 0) response += `- **Carbs**: ${(cSum / cCount).toFixed(1)} g / day\n`;
-					if (fCount > 0) response += `- **Fat**: ${(fSum / fCount).toFixed(1)} g / day\n`;
-
-					return { content: [{ type: 'text', text: response }] };
-				}
-
-				case 'get_energy_balance': {
-					const days = validateDays(typedArgs.days);
-					const rows = db.getEnergyBalance(days);
-
-					if (rows.length === 0) {
-						return { content: [{ type: 'text', text: `No Whoop cycle data in the last ${days} days.` }] };
-					}
-
-					let weightKg: number | null = null;
-					try {
-						const body = await client.getBodyMeasurement();
-						weightKg = body.weight_kilogram;
-					} catch {
-						// ignore — we'll just skip protein/kg column
-					}
-
-					let response = `# Energy Balance (Last ${days} Days)\n\n`;
-					response += '| Date | kcal Out | kcal In | Balance | Protein';
-					if (weightKg !== null) response += ' | g/kg';
-					response += ' |\n|------|----------|---------|---------|---------';
-					if (weightKg !== null) response += '|------';
-					response += '|\n';
-
-					const rowsWithBoth = rows.filter(r => r.kcal_in !== null && r.kcal_out !== null);
-					let totalDeficit = 0;
-					for (const r of rows) {
-						const kOut = r.kcal_out !== null ? `${r.kcal_out.toFixed(0)}` : 'N/A';
-						const kIn = r.kcal_in !== null ? `${r.kcal_in.toFixed(0)}` : 'N/A';
-						let balanceCell = 'N/A';
-						if (r.kcal_in !== null && r.kcal_out !== null) {
-							const delta = r.kcal_in - r.kcal_out;
-							totalDeficit += delta;
-							balanceCell = `${delta > 0 ? '+' : ''}${delta.toFixed(0)}`;
-						}
-						const p = r.protein_g !== null ? `${r.protein_g.toFixed(0)} g` : 'N/A';
-						let line = `| ${formatDate(r.date)} | ${kOut} | ${kIn} | ${balanceCell} | ${p}`;
-						if (weightKg !== null) {
-							const perKg = r.protein_g !== null ? (r.protein_g / weightKg).toFixed(2) : 'N/A';
-							line += ` | ${perKg}`;
-						}
-						line += ' |\n';
-						response += line;
-					}
-
-					response += `\n### Summary\n`;
-					response += `- **Days with both Whoop + nutrition data**: ${rowsWithBoth.length} / ${rows.length}\n`;
-					if (rowsWithBoth.length > 0) {
-						const avgDelta = totalDeficit / rowsWithBoth.length;
-						response += `- **Avg daily balance**: ${avgDelta > 0 ? '+' : ''}${avgDelta.toFixed(0)} kcal ${avgDelta > 0 ? '(surplus)' : '(deficit)'}\n`;
-						response += `- **Cumulative balance**: ${totalDeficit > 0 ? '+' : ''}${totalDeficit.toFixed(0)} kcal over ${rowsWithBoth.length} days\n`;
-					}
-					if (weightKg !== null) {
-						const withProtein = rows.filter(r => r.protein_g !== null);
-						if (withProtein.length > 0) {
-							const avgProteinPerKg = withProtein.reduce((s, r) => s + (r.protein_g ?? 0), 0) / withProtein.length / weightKg;
-							response += `- **Avg protein**: ${avgProteinPerKg.toFixed(2)} g/kg/day (target for strength: 1.6–2.2)\n`;
-						}
-					}
-
-					return { content: [{ type: 'text', text: response }] };
-				}
-
-				case 'get_daily_activity': {
-					const days = validateDays(typedArgs.days);
-					const metrics = ['step_count', 'walking_running_distance', 'flights_climbed'];
-					const rows = db.getHealthkitDailyTotals(days, metrics);
-
-					if (rows.length === 0) {
-						return { content: [{ type: 'text', text: `No activity data in the last ${days} days.` }] };
-					}
-
-					type Day = { steps: number | null; km: number | null; flights: number | null };
-					const byDate = new Map<string, Day>();
-					for (const r of rows) {
-						if (!byDate.has(r.date)) byDate.set(r.date, { steps: null, km: null, flights: null });
-						const d = byDate.get(r.date)!;
-						if (r.metric === 'step_count') d.steps = r.total;
-						else if (r.metric === 'walking_running_distance') d.km = r.total;
-						else if (r.metric === 'flights_climbed') d.flights = r.total;
-					}
-
-					const dates = Array.from(byDate.keys()).sort().reverse();
-					let response = `# Daily Activity (Last ${days} Days)\n\n`;
-					response += '| Date | Steps | Distance | Flights |\n|------|-------|----------|---------|\n';
-					for (const date of dates) {
-						const d = byDate.get(date)!;
-						response += `| ${formatDate(date)} `
-							+ `| ${d.steps !== null ? Math.round(d.steps).toLocaleString() : 'N/A'} `
-							+ `| ${d.km !== null ? d.km.toFixed(2) + ' km' : 'N/A'} `
-							+ `| ${d.flights !== null ? Math.round(d.flights) : 'N/A'} |\n`;
-					}
-
-					const allDays = dates.map(d => byDate.get(d)!);
-					const avgOf = (sel: (d: Day) => number | null): number | null => {
-						const vs = allDays.map(sel).filter((v): v is number => v !== null);
-						return vs.length > 0 ? vs.reduce((s, v) => s + v, 0) / vs.length : null;
-					};
-					const avgSteps = avgOf(d => d.steps);
-					const avgKm = avgOf(d => d.km);
-					const avgFlights = avgOf(d => d.flights);
-
-					response += `\n### Averages\n`;
-					if (avgSteps !== null) response += `- **Steps**: ${Math.round(avgSteps).toLocaleString()} / day\n`;
-					if (avgKm !== null) response += `- **Distance**: ${avgKm.toFixed(2)} km / day\n`;
-					if (avgFlights !== null) response += `- **Flights climbed**: ${avgFlights.toFixed(1)} / day\n`;
-
-					const lowMovementDays = allDays.filter(d => d.steps !== null && d.steps < 3000).length;
-					if (lowMovementDays > 0) {
-						response += `- **Low-movement days (<3k steps)**: ${lowMovementDays} / ${allDays.length}\n`;
-					}
-
-					return { content: [{ type: 'text', text: response }] };
-				}
-
-				case 'get_energy_expenditure': {
-					const days = validateDays(typedArgs.days);
-					const rows = db.getHealthkitDailyTotals(days, ['basal_energy_burned', 'active_energy']);
-
-					if (rows.length === 0) {
-						return { content: [{ type: 'text', text: `No energy expenditure data in the last ${days} days.` }] };
-					}
-
-					const toKcal = (qty: number, units: string | null): number => units === 'kJ' ? qty / 4.184 : qty;
-					type Day = { basal: number | null; active: number | null };
-					const byDate = new Map<string, Day>();
-					for (const r of rows) {
-						if (!byDate.has(r.date)) byDate.set(r.date, { basal: null, active: null });
-						const d = byDate.get(r.date)!;
-						if (r.metric === 'basal_energy_burned') d.basal = toKcal(r.total, r.units);
-						else if (r.metric === 'active_energy') d.active = toKcal(r.total, r.units);
-					}
-
-					const strainTrends = db.getStrainTrends(days);
-					const whoopByDate = new Map(strainTrends.map(s => [s.date, s.calories]));
-
-					const dates = Array.from(byDate.keys()).sort().reverse();
-					let response = `# Energy Expenditure (Last ${days} Days)\n\n`;
-					response += '| Date | Basal | Active | Apple TDEE | Whoop kcal | Δ |\n';
-					response += '|------|-------|--------|------------|------------|---|\n';
-
-					let sumBasal = 0, sumActive = 0;
-					let basalN = 0, activeN = 0;
-					const deltas: number[] = [];
-
-					for (const date of dates) {
-						const d = byDate.get(date)!;
-						const tdee = d.basal !== null && d.active !== null ? d.basal + d.active : null;
-						const whoop = whoopByDate.get(date) ?? null;
-						const delta = tdee !== null && whoop !== null ? tdee - whoop : null;
-						if (d.basal !== null) { sumBasal += d.basal; basalN++; }
-						if (d.active !== null) { sumActive += d.active; activeN++; }
-						if (delta !== null) deltas.push(delta);
-						response += `| ${formatDate(date)} `
-							+ `| ${d.basal !== null ? d.basal.toFixed(0) : 'N/A'} `
-							+ `| ${d.active !== null ? d.active.toFixed(0) : 'N/A'} `
-							+ `| ${tdee !== null ? tdee.toFixed(0) : 'N/A'} `
-							+ `| ${whoop !== null ? whoop.toFixed(0) : 'N/A'} `
-							+ `| ${delta !== null ? (delta > 0 ? '+' : '') + delta.toFixed(0) : 'N/A'} |\n`;
-					}
-
-					response += `\n### Summary\n`;
-					if (basalN > 0) response += `- **Avg basal (BMR)**: ${(sumBasal / basalN).toFixed(0)} kcal / day\n`;
-					if (activeN > 0) response += `- **Avg active**: ${(sumActive / activeN).toFixed(0)} kcal / day\n`;
-					if (basalN > 0 && activeN > 0) {
-						response += `- **Avg Apple TDEE**: ${((sumBasal / basalN) + (sumActive / activeN)).toFixed(0)} kcal / day\n`;
-					}
-					if (deltas.length > 0) {
-						const avgDelta = deltas.reduce((s, v) => s + v, 0) / deltas.length;
-						response += `- **Avg Apple − Whoop**: ${avgDelta > 0 ? '+' : ''}${avgDelta.toFixed(0)} kcal (${avgDelta > 0 ? 'Apple higher' : 'Whoop higher'})\n`;
-					}
-
-					return { content: [{ type: 'text', text: response }] };
-				}
-
-				case 'get_body_composition': {
-					const days = validateDays(typedArgs.days ?? 30);
-					const rows = db.getGarminBodyComposition(days);
-					if (rows.length === 0) {
-						return { content: [{ type: 'text', text: `No body composition data in the last ${days} days. Run the local garmin_push.py script on your laptop to sync weigh-ins from Garmin Connect.` }] };
-					}
-
-					let response = `# Body Composition (Last ${days} Days)\n\n`;
-					response += '| Date | Weight (kg) | BMI | Body Fat % | Muscle Mass (kg) | Bone Mass (kg) | Body Water % |\n';
-					response += '|------|-------------|-----|------------|------------------|----------------|--------------|\n';
-
-					const oneEntryPerDay = new Map<string, typeof rows[number]>();
-					for (const r of rows) {
-						const existing = oneEntryPerDay.get(r.calendar_date);
-						if (!existing || r.timestamp_gmt > existing.timestamp_gmt) {
-							oneEntryPerDay.set(r.calendar_date, r);
-						}
-					}
-					const daily = Array.from(oneEntryPerDay.values()).sort((a, b) => b.timestamp_gmt - a.timestamp_gmt);
-
-					for (const r of daily) {
-						response += `| ${formatDate(r.calendar_date)} `
-							+ `| ${r.weight_kg.toFixed(1)} `
-							+ `| ${r.bmi !== null ? r.bmi.toFixed(1) : 'N/A'} `
-							+ `| ${r.body_fat_pct !== null ? r.body_fat_pct.toFixed(1) + '%' : 'N/A'} `
-							+ `| ${r.muscle_mass_kg !== null ? r.muscle_mass_kg.toFixed(1) : 'N/A'} `
-							+ `| ${r.bone_mass_kg !== null ? r.bone_mass_kg.toFixed(2) : 'N/A'} `
-							+ `| ${r.body_water_pct !== null ? r.body_water_pct.toFixed(1) + '%' : 'N/A'} |\n`;
-					}
-
-					const weights = daily.map(r => r.weight_kg);
-					const avg = (arr: number[]): number => arr.length > 0 ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
-					const recent7 = weights.slice(0, Math.min(7, weights.length));
-					const recent30 = weights.slice(0, Math.min(30, weights.length));
-					const older7 = weights.slice(7, 14);
-
-					response += `\n### Summary\n`;
-					response += `- **Weigh-ins**: ${daily.length} days (${rows.length} total samples)\n`;
-					if (recent7.length > 0) response += `- **7-day avg weight**: ${avg(recent7).toFixed(2)} kg\n`;
-					if (recent30.length >= 7) response += `- **30-day avg weight**: ${avg(recent30).toFixed(2)} kg\n`;
-					if (recent7.length >= 3 && older7.length >= 3) {
-						const delta = avg(recent7) - avg(older7);
-						const direction = delta > 0.1 ? 'gaining' : delta < -0.1 ? 'losing' : 'steady';
-						response += `- **Week-over-week delta**: ${delta > 0 ? '+' : ''}${delta.toFixed(2)} kg (${direction})\n`;
-					}
-					const bfs = daily.map(r => r.body_fat_pct).filter((v): v is number => v !== null);
-					if (bfs.length > 0) response += `- **Avg body fat**: ${avg(bfs).toFixed(1)}%\n`;
-					const muscles = daily.map(r => r.muscle_mass_kg).filter((v): v is number => v !== null);
-					if (muscles.length >= 3) {
-						const recentMuscle = avg(muscles.slice(0, 7));
-						const olderMuscle = muscles.length >= 14 ? avg(muscles.slice(7, 14)) : null;
-						response += `- **Latest muscle mass**: ${muscles[0].toFixed(1)} kg`;
-						if (olderMuscle !== null) {
-							const mDelta = recentMuscle - olderMuscle;
-							response += ` (${mDelta > 0 ? '+' : ''}${mDelta.toFixed(2)} kg week-over-week)`;
-						}
-						response += '\n';
-					}
-
-					return { content: [{ type: 'text', text: response }] };
-				}
-
-				case 'get_gait_metrics': {
-					const days = validateDays(typedArgs.days);
-					const metrics = ['walking_speed', 'walking_step_length', 'walking_asymmetry_percentage', 'walking_double_support_percentage'];
-					const rows = db.getHealthkitDailyAvg(days, metrics);
-
-					if (rows.length === 0) {
-						return { content: [{ type: 'text', text: `No gait data in the last ${days} days.` }] };
-					}
-
-					type Day = { speed: number | null; stepLen: number | null; asym: number | null; dblSupp: number | null };
-					const byDate = new Map<string, Day>();
-					for (const r of rows) {
-						if (!byDate.has(r.date)) byDate.set(r.date, { speed: null, stepLen: null, asym: null, dblSupp: null });
-						const d = byDate.get(r.date)!;
-						if (r.metric === 'walking_speed') d.speed = r.avg;
-						else if (r.metric === 'walking_step_length') d.stepLen = r.avg;
-						else if (r.metric === 'walking_asymmetry_percentage') d.asym = r.avg;
-						else if (r.metric === 'walking_double_support_percentage') d.dblSupp = r.avg;
-					}
-
-					const dates = Array.from(byDate.keys()).sort().reverse();
-					let response = `# Gait Metrics (Last ${days} Days)\n\n`;
-					response += '| Date | Speed (km/h) | Step length (cm) | Asymmetry % | Double-support % |\n';
-					response += '|------|--------------|------------------|-------------|------------------|\n';
-					for (const date of dates) {
-						const d = byDate.get(date)!;
-						response += `| ${formatDate(date)} `
-							+ `| ${d.speed !== null ? d.speed.toFixed(2) : 'N/A'} `
-							+ `| ${d.stepLen !== null ? d.stepLen.toFixed(1) : 'N/A'} `
-							+ `| ${d.asym !== null ? d.asym.toFixed(1) : 'N/A'} `
-							+ `| ${d.dblSupp !== null ? d.dblSupp.toFixed(1) : 'N/A'} |\n`;
-					}
-
-					const allDays = dates.map(d => byDate.get(d)!);
-					const avgOf = (sel: (d: Day) => number | null): number | null => {
-						const vs = allDays.map(sel).filter((v): v is number => v !== null);
-						return vs.length > 0 ? vs.reduce((s, v) => s + v, 0) / vs.length : null;
-					};
-					const aSpeed = avgOf(d => d.speed);
-					const aStepLen = avgOf(d => d.stepLen);
-					const aAsym = avgOf(d => d.asym);
-					const aDbl = avgOf(d => d.dblSupp);
-
-					response += `\n### Averages\n`;
-					if (aSpeed !== null) response += `- **Walking speed**: ${aSpeed.toFixed(2)} km/h\n`;
-					if (aStepLen !== null) response += `- **Step length**: ${aStepLen.toFixed(1)} cm\n`;
-					if (aAsym !== null) {
-						response += `- **Asymmetry**: ${aAsym.toFixed(1)}%`;
-						if (aAsym >= 3) response += ` (⚠ Apple flags >3% as a watch-point)`;
-						response += '\n';
-					}
-					if (aDbl !== null) response += `- **Double-support time**: ${aDbl.toFixed(1)}%\n`;
-
-					return { content: [{ type: 'text', text: response }] };
-				}
-
 				default:
 					throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
 			}
@@ -1231,6 +771,10 @@ function createMcpServer(): Server {
 }
 
 async function main(): Promise<void> {
+	if (config.mcpPathSecret && config.mcpPathSecret.length < 32) {
+		throw new Error('MCP_PATH_SECRET must be at least 32 characters (try: openssl rand -hex 32)');
+	}
+
 	if (config.mode === 'stdio') {
 		const server = createMcpServer();
 		const transport = new StdioServerTransport();
@@ -1244,6 +788,10 @@ async function main(): Promise<void> {
 			const code = req.query.code as string | undefined;
 			if (!code) {
 				res.status(400).send('Missing authorization code');
+				return;
+			}
+			if (!consumeOauthState(req.query.state as string | undefined)) {
+				res.status(400).send('Invalid or expired state. Start again from get_auth_url.');
 				return;
 			}
 
@@ -1261,87 +809,19 @@ async function main(): Promise<void> {
 			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
 		});
 
-		app.post('/garmin/body-composition', (req: Request, res: Response) => {
-			if (!config.garminPushToken) {
-				res.status(503).json({ error: 'GARMIN_PUSH_TOKEN not configured on server' });
-				return;
-			}
-			if (req.headers.authorization !== `Bearer ${config.garminPushToken}`) {
-				res.status(401).json({ error: 'unauthorized' });
-				return;
-			}
+		// With MCP_PATH_SECRET set, the MCP endpoint lives at /mcp/<secret> and
+		// plain /mcp returns 404. Without it, /mcp is open to anyone with the URL.
+		const mcpPath = config.mcpPathSecret ? '/mcp/:secret' : '/mcp';
+		if (!config.mcpPathSecret) {
+			process.stderr.write('WARNING: MCP_PATH_SECRET is not set; /mcp is unauthenticated.\n');
+		}
 
-			const body = req.body as { entries?: Array<Record<string, unknown>> };
-			const entries = body?.entries;
-			if (!Array.isArray(entries)) {
-				res.status(400).json({ error: 'expected { entries: [...] }' });
+		app.all(mcpPath, async (req: Request, res: Response) => {
+			if (config.mcpPathSecret && !secretMatches(req.params.secret as string | undefined, config.mcpPathSecret)) {
+				res.status(404).send('Not found');
 				return;
 			}
 
-			type Entry = Parameters<typeof db.upsertGarminBodyComposition>[0][number];
-			const clean: Entry[] = [];
-			for (const e of entries) {
-				const samplePk = typeof e.samplePk === 'number' ? e.samplePk : null;
-				const calendarDate = typeof e.calendarDate === 'string' ? e.calendarDate : null;
-				const timestampGMT = typeof e.timestampGMT === 'number' ? e.timestampGMT : null;
-				const weight = typeof e.weight === 'number' ? e.weight : null;
-				if (samplePk === null || !calendarDate || timestampGMT === null || weight === null) continue;
-				const numOrNull = (v: unknown): number | null => typeof v === 'number' ? v : null;
-				clean.push({
-					samplePk,
-					calendarDate,
-					timestampGMT,
-					weight,
-					bmi: numOrNull(e.bmi),
-					bodyFat: numOrNull(e.bodyFat),
-					bodyWater: numOrNull(e.bodyWater),
-					boneMass: numOrNull(e.boneMass),
-					muscleMass: numOrNull(e.muscleMass),
-					physiqueRating: numOrNull(e.physiqueRating),
-					visceralFat: numOrNull(e.visceralFat),
-					metabolicAge: numOrNull(e.metabolicAge),
-					sourceType: typeof e.sourceType === 'string' ? e.sourceType : 'UNKNOWN',
-				});
-			}
-
-			const inserted = db.upsertGarminBodyComposition(clean);
-			res.json({ received: entries.length, accepted: clean.length, upserted: inserted });
-		});
-
-		app.post('/healthkit', (req: Request, res: Response) => {
-			if (!config.healthkitToken) {
-				res.status(503).json({ error: 'HEALTHKIT_TOKEN not configured on server' });
-				return;
-			}
-			const auth = req.headers.authorization;
-			if (auth !== `Bearer ${config.healthkitToken}`) {
-				res.status(401).json({ error: 'unauthorized' });
-				return;
-			}
-
-			const body = req.body as { data?: { metrics?: Array<{ name?: string; units?: string; data?: Array<{ qty?: number; date?: string }> }> } };
-			const metrics = body?.data?.metrics;
-			if (!Array.isArray(metrics)) {
-				res.status(400).json({ error: 'expected { data: { metrics: [...] } }' });
-				return;
-			}
-
-			const samples: Array<{ metric: string; date: string; qty: number; units: string | null }> = [];
-			for (const m of metrics) {
-				if (!m?.name || !Array.isArray(m.data)) continue;
-				for (const entry of m.data) {
-					if (typeof entry?.qty !== 'number' || typeof entry?.date !== 'string') continue;
-					const iso = new Date(entry.date).toISOString();
-					if (Number.isNaN(new Date(iso).getTime())) continue;
-					samples.push({ metric: m.name, date: iso, qty: entry.qty, units: m.units ?? null });
-				}
-			}
-
-			const inserted = db.upsertHealthkitSamples(samples);
-			res.json({ received: samples.length, inserted, skipped: samples.length - inserted });
-		});
-
-		app.all('/mcp', async (req: Request, res: Response) => {
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
 			if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
@@ -1366,7 +846,7 @@ async function main(): Promise<void> {
 			if (sessionId) {
 				res.status(404).json({
 					jsonrpc: '2.0',
-					error: { code: -32001, message: 'Session not found. Re-initialize via POST /mcp.' },
+					error: { code: -32001, message: 'Session not found. Re-initialize.' },
 					id: null,
 				});
 				return;
@@ -1374,7 +854,7 @@ async function main(): Promise<void> {
 
 			if (req.method === 'POST') {
 				const transport = new StreamableHTTPServerTransport({
-					sessionIdGenerator: () => crypto.randomUUID(),
+					sessionIdGenerator: () => randomUUID(),
 					onsessioninitialized: newSessionId => {
 						transports.set(newSessionId, { transport, lastAccess: Date.now() });
 					},
