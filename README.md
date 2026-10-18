@@ -131,6 +131,9 @@ EOF
 
 # Run in development mode
 npm run dev
+
+# Run tests
+npm test
 ```
 
 ## Environment Variables

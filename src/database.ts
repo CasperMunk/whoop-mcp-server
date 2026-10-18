@@ -101,6 +101,7 @@ export class WhoopDatabase {
 				user_id INTEGER NOT NULL,
 				start_time TEXT NOT NULL,
 				end_time TEXT,
+				timezone_offset TEXT,
 				score_state TEXT NOT NULL,
 				strain REAL,
 				kilojoule REAL,
@@ -130,6 +131,7 @@ export class WhoopDatabase {
 				cycle_id INTEGER,
 				start_time TEXT NOT NULL,
 				end_time TEXT NOT NULL,
+				timezone_offset TEXT,
 				is_nap INTEGER NOT NULL DEFAULT 0,
 				score_state TEXT NOT NULL,
 				total_in_bed_milli INTEGER,
@@ -241,6 +243,9 @@ export class WhoopDatabase {
 			['altitude_gain_meter', 'REAL'],
 			['altitude_change_meter', 'REAL'],
 		]);
+		this.migrateColumns('cycles', [
+			['timezone_offset', 'TEXT'],
+		]);
 		this.migrateColumns('recovery', [
 			['user_calibrating', 'INTEGER'],
 		]);
@@ -249,7 +254,37 @@ export class WhoopDatabase {
 			['sleep_cycle_count', 'INTEGER'],
 			['disturbance_count', 'INTEGER'],
 			['sleep_needed_nap_milli', 'INTEGER'],
+			['timezone_offset', 'TEXT'],
 		]);
+
+		// Whoop labels a cycle with the local date on which its opening sleep ended
+		// (the morning you wake up), not the date it started: cycles begin at sleep
+		// onset, which is often the evening before. Every day-level query reads the
+		// label from here so sleep, strain and recovery always agree.
+		// Fallbacks, in order: the sleep the cycle's recovery points at, the cycle's
+		// own non-nap sleep, the recovery's creation time, and finally (an open cycle
+		// whose sleep is not scored yet) the cycle start plus 12 hours.
+		// Rows synced before offsets were stored have NULL offsets and fall back to UTC.
+		this.db.exec(`
+			DROP VIEW IF EXISTS cycle_days;
+			CREATE VIEW cycle_days AS
+			SELECT
+				c.*,
+				COALESCE(
+					DATE(rs.end_time, COALESCE(rs.timezone_offset, c.timezone_offset, '+00:00')),
+					DATE(cs.end_time, COALESCE(cs.timezone_offset, c.timezone_offset, '+00:00')),
+					DATE(r.created_at, COALESCE(c.timezone_offset, '+00:00')),
+					DATE(c.start_time, COALESCE(c.timezone_offset, '+00:00'), '+12 hours')
+				) AS day
+			FROM cycles c
+			LEFT JOIN recovery r ON r.id = c.id
+			LEFT JOIN sleep rs ON rs.id = r.sleep_id
+			LEFT JOIN sleep cs ON cs.id = (
+				SELECT s.id FROM sleep s
+				WHERE s.cycle_id = c.id AND s.is_nap = 0
+				ORDER BY julianday(s.start_time) LIMIT 1
+			);
+		`);
 	}
 
 	private migrateColumns(table: string, additions: Array<[string, string]>): void {
@@ -317,8 +352,8 @@ export class WhoopDatabase {
 
 	upsertCycles(cycles: WhoopCycle[]): void {
 		const stmt = this.db.prepare(`
-			INSERT OR REPLACE INTO cycles (id, user_id, start_time, end_time, score_state, strain, kilojoule, avg_hr, max_hr, synced_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+			INSERT OR REPLACE INTO cycles (id, user_id, start_time, end_time, timezone_offset, score_state, strain, kilojoule, avg_hr, max_hr, synced_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		`);
 
 		const insertMany = this.db.transaction((items: WhoopCycle[]) => {
@@ -328,6 +363,7 @@ export class WhoopDatabase {
 					c.user_id,
 					c.start,
 					c.end,
+					c.timezone_offset ?? null,
 					c.score_state,
 					c.score?.strain ?? null,
 					c.score?.kilojoule ?? null,
@@ -371,14 +407,14 @@ export class WhoopDatabase {
 	upsertSleeps(sleeps: WhoopSleep[]): void {
 		const stmt = this.db.prepare(`
 			INSERT OR REPLACE INTO sleep (
-				id, user_id, start_time, end_time, is_nap, score_state,
+				id, user_id, cycle_id, start_time, end_time, timezone_offset, is_nap, score_state,
 				total_in_bed_milli, total_awake_milli, total_no_data_milli,
 				total_light_milli, total_deep_milli, total_rem_milli,
 				sleep_cycle_count, disturbance_count,
 				sleep_performance, sleep_efficiency, sleep_consistency, respiratory_rate,
 				sleep_needed_baseline_milli, sleep_needed_debt_milli, sleep_needed_strain_milli, sleep_needed_nap_milli,
 				synced_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		`);
 
 		const insertMany = this.db.transaction((items: WhoopSleep[]) => {
@@ -386,8 +422,10 @@ export class WhoopDatabase {
 				stmt.run(
 					s.id,
 					s.user_id,
+					s.cycle_id ?? null,
 					s.start,
 					s.end,
+					s.timezone_offset ?? null,
 					s.nap ? 1 : 0,
 					s.score_state,
 					s.score?.stage_summary.total_in_bed_time_milli ?? null,
@@ -463,6 +501,10 @@ export class WhoopDatabase {
 		return this.db.prepare('SELECT * FROM cycles ORDER BY start_time DESC LIMIT 1').get() as DbCycle | undefined ?? null;
 	}
 
+	getLatestCompletedCycle(): DbCycle | null {
+		return this.db.prepare('SELECT * FROM cycles WHERE end_time IS NOT NULL ORDER BY start_time DESC LIMIT 1').get() as DbCycle | undefined ?? null;
+	}
+
 	getLatestRecovery(): DbRecovery | null {
 		return this.db.prepare('SELECT * FROM recovery ORDER BY created_at DESC LIMIT 1').get() as DbRecovery | undefined ?? null;
 	}
@@ -498,21 +540,24 @@ export class WhoopDatabase {
 
 	getRecoveryTrends(days: number): RecoveryTrendRow[] {
 		return this.db.prepare(`
-			SELECT DATE(created_at) as date, recovery_score, hrv_rmssd as hrv, resting_hr as rhr
-			FROM recovery
-			WHERE recovery_score IS NOT NULL AND created_at >= DATE('now', '-' || ? || ' days')
-			ORDER BY created_at DESC
+			SELECT COALESCE(cd.day, DATE(r.created_at)) as date, r.recovery_score, r.hrv_rmssd as hrv, r.resting_hr as rhr
+			FROM recovery r
+			LEFT JOIN cycle_days cd ON cd.id = r.id
+			WHERE r.recovery_score IS NOT NULL AND COALESCE(cd.day, DATE(r.created_at)) >= DATE('now', '-' || ? || ' days')
+			ORDER BY r.created_at DESC
 		`).all(days) as RecoveryTrendRow[];
 	}
 
 	getSleepTrends(days: number): SleepTrendRow[] {
 		return this.db.prepare(`
-			SELECT DATE(start_time) as date,
-				ROUND((total_in_bed_milli - total_awake_milli) / 3600000.0, 2) as total_sleep_hours,
-				sleep_performance as performance, sleep_efficiency as efficiency
-			FROM sleep
-			WHERE is_nap = 0 AND sleep_performance IS NOT NULL AND start_time >= DATE('now', '-' || ? || ' days')
-			ORDER BY start_time DESC
+			SELECT DATE(s.end_time, COALESCE(s.timezone_offset, c.timezone_offset, '+00:00')) as date,
+				ROUND((s.total_in_bed_milli - s.total_awake_milli) / 3600000.0, 2) as total_sleep_hours,
+				s.sleep_performance as performance, s.sleep_efficiency as efficiency
+			FROM sleep s
+			LEFT JOIN cycles c ON c.id = s.cycle_id
+			WHERE s.is_nap = 0 AND s.sleep_performance IS NOT NULL
+				AND DATE(s.end_time, COALESCE(s.timezone_offset, c.timezone_offset, '+00:00')) >= DATE('now', '-' || ? || ' days')
+			ORDER BY s.start_time DESC
 		`).all(days) as SleepTrendRow[];
 	}
 
@@ -550,30 +595,42 @@ export class WhoopDatabase {
 
 	getDailyTrainingLoad(days: number): DailyLoadRow[] {
 		return this.db.prepare(`
+			WITH ranged AS (
+				SELECT
+					cd.*,
+					julianday(cd.start_time) as start_jd,
+					COALESCE(julianday(cd.end_time), julianday('now')) as end_jd
+				FROM cycle_days cd
+			)
 			SELECT
-				DATE(c.start_time) as date,
+				c.day as date,
 				c.strain as day_strain,
 				(SELECT COUNT(*) FROM workouts w
-					WHERE DATE(w.start_time) = DATE(c.start_time) AND w.strain IS NOT NULL) as workout_count,
+					WHERE julianday(w.start_time) >= c.start_jd AND julianday(w.start_time) < c.end_jd
+						AND w.strain IS NOT NULL) as workout_count,
 				(SELECT GROUP_CONCAT(DISTINCT COALESCE(sport_name, 'sport#' || sport_id))
-					FROM workouts w WHERE DATE(w.start_time) = DATE(c.start_time)) as sports,
-				(SELECT recovery_score FROM recovery r
-					WHERE DATE(r.created_at) = DATE(c.start_time, '+1 day')
-						AND r.recovery_score IS NOT NULL LIMIT 1) as next_recovery,
-				(SELECT hrv_rmssd FROM recovery r
-					WHERE DATE(r.created_at) = DATE(c.start_time, '+1 day')
-						AND r.hrv_rmssd IS NOT NULL LIMIT 1) as next_hrv
-			FROM cycles c
+					FROM workouts w
+					WHERE julianday(w.start_time) >= c.start_jd AND julianday(w.start_time) < c.end_jd) as sports,
+				nr.recovery_score as next_recovery,
+				nr.hrv_rmssd as next_hrv
+			FROM ranged c
+			-- Next-day recovery is the recovery of the cycle that follows, i.e. the
+			-- morning after this day's sleep. If that cycle has no recovery, it stays NULL.
+			LEFT JOIN recovery nr ON nr.id = (
+				SELECT n.id FROM cycles n
+				WHERE julianday(n.start_time) > c.start_jd
+				ORDER BY julianday(n.start_time) LIMIT 1
+			)
 			WHERE c.strain IS NOT NULL
-				AND c.start_time >= DATE('now', '-' || ? || ' days')
-			ORDER BY c.start_time DESC
+				AND c.day >= DATE('now', '-' || ? || ' days')
+			ORDER BY c.start_jd DESC
 		`).all(days) as DailyLoadRow[];
 	}
 
 	getSleepDebtTrend(days: number): SleepDebtRow[] {
 		return this.db.prepare(`
 			SELECT
-				DATE(start_time) as date,
+				DATE(s.end_time, COALESCE(s.timezone_offset, c.timezone_offset, '+00:00')) as date,
 				(COALESCE(total_in_bed_milli, 0)
 					- COALESCE(total_awake_milli, 0)
 					- COALESCE(total_no_data_milli, 0)) as actual_sleep_ms,
@@ -595,19 +652,20 @@ export class WhoopDatabase {
 					- (COALESCE(total_in_bed_milli, 0)
 						- COALESCE(total_awake_milli, 0)
 						- COALESCE(total_no_data_milli, 0))) as shortfall_ms
-			FROM sleep
-			WHERE is_nap = 0
-				AND sleep_needed_baseline_milli IS NOT NULL
-				AND start_time >= DATE('now', '-' || ? || ' days')
-			ORDER BY start_time DESC
+			FROM sleep s
+			LEFT JOIN cycles c ON c.id = s.cycle_id
+			WHERE s.is_nap = 0
+				AND s.sleep_needed_baseline_milli IS NOT NULL
+				AND DATE(s.end_time, COALESCE(s.timezone_offset, c.timezone_offset, '+00:00')) >= DATE('now', '-' || ? || ' days')
+			ORDER BY s.start_time DESC
 		`).all(days) as SleepDebtRow[];
 	}
 
 	getStrainTrends(days: number): StrainTrendRow[] {
 		return this.db.prepare(`
-			SELECT DATE(start_time) as date, strain, ROUND(kilojoule / 4.184, 0) as calories
-			FROM cycles
-			WHERE strain IS NOT NULL AND start_time >= DATE('now', '-' || ? || ' days')
+			SELECT day as date, strain, ROUND(kilojoule / 4.184, 0) as calories
+			FROM cycle_days
+			WHERE strain IS NOT NULL AND day >= DATE('now', '-' || ? || ' days')
 			ORDER BY start_time DESC
 		`).all(days) as StrainTrendRow[];
 	}
@@ -676,11 +734,11 @@ export class WhoopDatabase {
 		return this.db.prepare(`
 			WITH windowed AS (
 				SELECT
-					DATE(start_time) as date,
+					day as date,
 					datetime(start_time) as start_dt,
 					COALESCE(datetime(end_time), datetime(start_time, '+24 hours')) as end_dt,
 					ROUND(kilojoule / 4.184, 0) as kcal_out
-				FROM cycles
+				FROM cycle_days
 				WHERE kilojoule IS NOT NULL
 					AND start_time >= datetime('now', '-' || ? || ' days')
 			)
