@@ -21,7 +21,7 @@ const config = {
 	dbPath: process.env.DB_PATH ?? './whoop.db',
 	port: Number.parseInt(process.env.PORT ?? '3000', 10),
 	mode: process.env.MCP_MODE ?? 'http',
-	mcpPathSecret: process.env.MCP_PATH_SECRET ?? '',
+	mcpAuthToken: process.env.MCP_AUTH_TOKEN ?? '',
 };
 
 const db = new WhoopDatabase(config.dbPath);
@@ -58,10 +58,10 @@ function consumeOauthState(state: string | undefined): boolean {
 	return expiresAt !== undefined && expiresAt > Date.now();
 }
 
-function secretMatches(candidate: string | undefined, secret: string): boolean {
-	if (!candidate) return false;
-	const a = Buffer.from(candidate);
-	const b = Buffer.from(secret);
+function bearerMatches(header: string | undefined, token: string): boolean {
+	if (!header?.startsWith('Bearer ')) return false;
+	const a = Buffer.from(header.slice('Bearer '.length));
+	const b = Buffer.from(token);
 	return a.length === b.length && timingSafeEqual(a, b);
 }
 
@@ -771,8 +771,8 @@ function createMcpServer(): Server {
 }
 
 async function main(): Promise<void> {
-	if (config.mcpPathSecret && config.mcpPathSecret.length < 32) {
-		throw new Error('MCP_PATH_SECRET must be at least 32 characters (try: openssl rand -hex 32)');
+	if (config.mcpAuthToken && config.mcpAuthToken.length < 32) {
+		throw new Error('MCP_AUTH_TOKEN must be at least 32 characters (try: openssl rand -hex 32)');
 	}
 
 	if (config.mode === 'stdio') {
@@ -809,16 +809,24 @@ async function main(): Promise<void> {
 			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
 		});
 
-		// With MCP_PATH_SECRET set, the MCP endpoint lives at /mcp/<secret> and
-		// plain /mcp returns 404. Without it, /mcp is open to anyone with the URL.
-		const mcpPath = config.mcpPathSecret ? '/mcp/:secret' : '/mcp';
-		if (!config.mcpPathSecret) {
-			process.stderr.write('WARNING: MCP_PATH_SECRET is not set; /mcp is unauthenticated.\n');
+		// Every MCP request must carry Authorization: Bearer <MCP_AUTH_TOKEN>.
+		// claude.ai sends it from the connector's request headers. Without a
+		// configured token the endpoint stays closed rather than open.
+		if (!config.mcpAuthToken) {
+			process.stderr.write('WARNING: MCP_AUTH_TOKEN is not set; /mcp will refuse all requests.\n');
 		}
 
-		app.all(mcpPath, async (req: Request, res: Response) => {
-			if (config.mcpPathSecret && !secretMatches(req.params.secret as string | undefined, config.mcpPathSecret)) {
-				res.status(404).send('Not found');
+		app.all('/mcp', async (req: Request, res: Response) => {
+			if (!config.mcpAuthToken) {
+				res.status(503).send('MCP_AUTH_TOKEN is not configured on the server');
+				return;
+			}
+			if (!bearerMatches(req.headers.authorization, config.mcpAuthToken)) {
+				res.status(401).json({
+					jsonrpc: '2.0',
+					error: { code: -32001, message: 'Unauthorized' },
+					id: null,
+				});
 				return;
 			}
 

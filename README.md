@@ -80,7 +80,9 @@ Built using the [Whoop Developer API v2](https://developer.whoop.com/docs/introd
 2. Click "Add custom connector"
 3. Enter:
    - **Name**: Whoop
-   - **Remote MCP server URL**: `https://your-app.railway.app/mcp/<MCP_PATH_SECRET>`
+   - **Remote MCP server URL**: `https://your-app.railway.app/mcp`
+   - **Authentication**: No sign-in
+   - **Request header**: `Authorization` = `Bearer <MCP_AUTH_TOKEN>`
 4. Use it in any chat!
 
 ## Local Development
@@ -95,6 +97,7 @@ WHOOP_CLIENT_ID=your_client_id
 WHOOP_CLIENT_SECRET=your_client_secret
 WHOOP_REDIRECT_URI=http://localhost:3000/callback
 MCP_MODE=http
+MCP_AUTH_TOKEN=$(openssl rand -hex 32)
 EOF
 
 # Run in development mode
@@ -112,7 +115,7 @@ npm test
 | `WHOOP_CLIENT_SECRET` | Whoop OAuth client secret | Required |
 | `WHOOP_REDIRECT_URI` | OAuth callback URL | `http://localhost:3000/callback` |
 | `ENCRYPTION_SECRET` | Key-derivation secret for token-at-rest encryption | Falls back to `WHOOP_CLIENT_SECRET` |
-| `MCP_PATH_SECRET` | Random secret (32+ characters) that becomes part of the MCP URL: `/mcp/<secret>`. Generate with `openssl rand -hex 32` | Unset = unauthenticated `/mcp` with a startup warning |
+| `MCP_AUTH_TOKEN` | Bearer token every `/mcp` request must send as `Authorization: Bearer <token>`. At least 32 characters; generate with `openssl rand -hex 32` | Required in `http` mode; unset = `/mcp` returns 503 |
 | `DB_PATH` | SQLite database path | `./whoop.db` |
 | `PORT` | HTTP server port | `3000` |
 | `MCP_MODE` | `http` for remote, `stdio` for local | `http` |
