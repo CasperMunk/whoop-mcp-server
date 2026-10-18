@@ -21,7 +21,7 @@ const config = {
 	dbPath: process.env.DB_PATH ?? './whoop.db',
 	port: Number.parseInt(process.env.PORT ?? '3000', 10),
 	mode: process.env.MCP_MODE ?? 'http',
-	mcpAuthToken: process.env.MCP_AUTH_TOKEN ?? '',
+	mcpAuthToken: (process.env.MCP_AUTH_TOKEN ?? '').trim(),
 };
 
 const db = new WhoopDatabase(config.dbPath);
@@ -58,11 +58,16 @@ function consumeOauthState(state: string | undefined): boolean {
 	return expiresAt !== undefined && expiresAt > Date.now();
 }
 
-function bearerMatches(header: string | undefined, token: string): boolean {
-	if (!header?.startsWith('Bearer ')) return false;
-	const a = Buffer.from(header.slice('Bearer '.length));
+// Returns null when the Authorization header carries the token, otherwise a
+// reason for the log. Tolerates a missing or lower-case "Bearer" scheme and
+// stray whitespace from copy-pasting; never logs the token itself.
+function authFailure(header: string | undefined, token: string): string | null {
+	if (!header) return 'no Authorization header';
+	const value = header.trim().replace(/^bearer\s+/i, '').trim();
+	const a = Buffer.from(value);
 	const b = Buffer.from(token);
-	return a.length === b.length && timingSafeEqual(a, b);
+	if (a.length !== b.length) return `token length ${a.length}, expected ${b.length}`;
+	return timingSafeEqual(a, b) ? null : 'token mismatch';
 }
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
@@ -821,7 +826,9 @@ async function main(): Promise<void> {
 				res.status(503).send('MCP_AUTH_TOKEN is not configured on the server');
 				return;
 			}
-			if (!bearerMatches(req.headers.authorization, config.mcpAuthToken)) {
+			const failure = authFailure(req.headers.authorization, config.mcpAuthToken);
+			if (failure) {
+				process.stderr.write(`401 ${req.method} /mcp: ${failure}\n`);
 				res.status(401).json({
 					jsonrpc: '2.0',
 					error: { code: -32001, message: 'Unauthorized' },
